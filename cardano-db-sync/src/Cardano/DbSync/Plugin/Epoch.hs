@@ -25,8 +25,8 @@ import           Data.Time.Clock (UTCTime)
 import           Data.Word (Word64)
 
 import           Database.Esqueleto (InnerJoin (..), Value (..), (^.), (==.), (>=.),
-                    count, delete, desc, from, just, limit, max_, min_, on, orderBy, select, sum_,
-                    val, where_)
+                    count, countRows, delete, desc, from, just, limit, max_, min_, on, orderBy,
+                    select, sum_, val, where_)
 
 import           Database.Persist.Class (replace)
 import           Database.Persist.Sql (IsolationLevel (Serializable), SqlBackend,
@@ -127,6 +127,7 @@ insertPastEpochs trce maxEpochNum =
 
 updateEpochNum :: MonadIO m => Word64 -> Trace IO Text -> ReaderT SqlBackend m (Either DbSyncNodeError ())
 updateEpochNum epochNum trce = do
+    transactionSaveWithIsolation Serializable
     mid <- queryEpochId epochNum
     res <- maybe insertEpoch updateEpoch mid
     transactionSaveWithIsolation Serializable
@@ -170,33 +171,39 @@ queryEpochEntry epochNum = do
               on (tx ^. TxBlock ==. blk ^. BlockId)
               where_ (blk ^. BlockEpochNo ==. just (val epochNum))
               pure $ (sum_ (tx ^. TxOutSum), count (tx ^. TxOutSum), min_ (blk ^. BlockTime), max_ (blk ^. BlockTime))
+    blks <- select . from $ \ blk -> do
+              where_ (isJust $ blk ^. BlockSlotNo)
+              where_ (blk ^. BlockEpochNo ==. just (val epochNum))
+              pure countRows
+    let blkCount = maybe 0 unValue $ listToMaybe blks
     case listToMaybe res of
-      Nothing -> queryEmptyEpoch
-      Just x -> convert x
+      Nothing -> queryEmptyEpoch blkCount
+      Just x -> convert blkCount x
   where
     convert :: MonadIO m
-            => (ValMay Rational, Value Word64, ValMay UTCTime, ValMay UTCTime)
+            => Word64 -> (ValMay Rational, Value Word64, ValMay UTCTime, ValMay UTCTime)
             -> ReaderT SqlBackend m (Either DbSyncNodeError Epoch)
-    convert tuple =
+    convert blkCount tuple =
       case tuple of
         (Value (Just outSum), Value txCount, Value (Just start), Value (Just end)) ->
-            pure (Right $ Epoch (fromIntegral $ numerator outSum) txCount epochNum start end)
-        _otherwise -> queryEmptyEpoch
+            pure (Right $ Epoch (fromIntegral $ numerator outSum) txCount blkCount epochNum start end)
+        _otherwise -> queryEmptyEpoch blkCount
 
-    queryEmptyEpoch :: MonadIO m => ReaderT SqlBackend m (Either DbSyncNodeError Epoch)
-    queryEmptyEpoch = do
+    queryEmptyEpoch :: MonadIO m => Word64 -> ReaderT SqlBackend m (Either DbSyncNodeError Epoch)
+    queryEmptyEpoch blkCount = do
       res <- select . from $ \ blk -> do
+              where_ (isJust $ blk ^. BlockSlotNo)
               where_ (blk ^. BlockEpochNo ==. just (val epochNum))
-              pure (count (blk ^. BlockId), min_ (blk ^. BlockTime), max_ (blk ^. BlockTime))
+              pure (min_ (blk ^. BlockTime), max_ (blk ^. BlockTime))
       case listToMaybe res of
         Nothing -> pure $ Left (ENEEpochLookup epochNum)
-        Just x -> pure $ convert2 x
+        Just x -> pure $ convert2 blkCount x
 
-    convert2 :: (Value Word64, ValMay UTCTime, ValMay UTCTime) -> Either DbSyncNodeError Epoch
-    convert2 tuple =
+    convert2 :: Word64 -> (ValMay UTCTime, ValMay UTCTime) -> Either DbSyncNodeError Epoch
+    convert2 blkCount tuple =
       case tuple of
-        (Value blkCount, Value (Just start), Value (Just end)) | blkCount > 0 ->
-            Right (Epoch 0 0 epochNum start end)
+        (Value (Just start), Value (Just end)) ->
+            Right (Epoch 0 0 blkCount epochNum start end)
         _otherwise -> Left (ENEEpochLookup epochNum)
 
 -- | Get the epoch number of the most recent epoch in the Block table.
